@@ -49,9 +49,13 @@ rewrite `report.html`; `StoreReport::failed()` counts failures.
 ## Grouped store (`grouped::GroupedStore`)
 
 For suites that want nested scenario names and committed,
-human-reviewable artifacts. A scenario `<group>/…/<name>` commits
-EXACTLY four files under the approved root — no `.frame.json`, no
-sidecars:
+human-reviewable artifacts. `GroupedStore` supports two artifact modes
+via `GroupedStore::with_artifacts(ArtifactSet)`:
+
+### 1. `ArtifactSet::All` (default, 4 committed files per scenario)
+
+A scenario `<group>/…/<name>` commits four files under the approved
+root — no `.frame.json`, no sidecars:
 
 ```text
 snapshots/<group>/<name>_<cols>x<rows>_<profile>.ansi   # normalized SGR dump (cell-exact gate)
@@ -60,17 +64,94 @@ snapshots/<group>/<name>_<cols>x<rows>_<profile>.png    # colored image (pixel g
 snapshots/<group>/<name>_<cols>x<rows>_<profile>.html   # standalone colored HTML render
 ```
 
-Actuals (`<root>.actual/`), diff PNGs (`<root>.diff/`), and the
-report (`<root>.actual/report.html`) live OUTSIDE the approved tree
-by default; override with `with_actual_root` / `with_diff_root` /
-`with_report_path`. Gates: `.ansi`/`.txt`/`.html` byte-compares
-plus the same exact decoded-pixel PNG gate as the classic store.
-Actual PNG/HTML always render fresh from the candidate frame —
-never copied from approved. Missing approvals fail closed; names
-with absolute paths, `..`, empty segments, or backslashes are
-rejected (`InvalidName`). `accept(name)` blesses one scenario,
-`accept_all()` blesses every reviewed actual recursively and
-returns the accepted names.
+### 2. `ArtifactSet::AnsiCursor` (minimal `.ansi`-only baseline, on-demand PNG/HTML diff)
+
+For large multi-dimensional suites (thousands of scenarios), committing
+PNG and HTML files per scenario inflates repository size and passing-run
+I/O. With `.with_artifacts(ArtifactSet::AnsiCursor)`:
+
+- Only `<approved>/<name>.ansi` (written via
+  `render::ansi_dump_with_cursor`, which appends a canonical VT cursor
+  trailer `ESC[?25l` or `ESC[?25h ESC[<y>;<x>H ESC[<Ps> q`) is
+  committed to git.
+- **On a passing check**: the candidate's normalized `.ansi` + cursor
+  trailer is compared in memory against the approved `.ansi`. No PNG or
+  HTML rasterization runs (~0.37 ms per 120×40 check). The store writes
+  the sealed `<actual_root>/<name>.{ansi,manifest.json,verdict.json}`
+  and scrubs any stale mismatch-only files
+  (`<actual_root>/<name>.{txt,png,html,frame.json,png.fidelity.json}`,
+  `<expected_root>/<name>.{png,html}`, `<diff_root>/<name>.png`) left by
+  an earlier failing run.
+- **On a mismatch or missing approval**: `formats::ansi::frame_from_ansi`
+  reconstructs the expected `Frame` (including cursor position/shape/blink)
+  from the approved `.ansi`, populates `cell_diffs` and `note`, and —
+  when `store.review_evidence()` is `true` (default; disable via
+  `GroupedStore::with_review_evidence(false)` or
+  `TUISCOTTI_REVIEW_EVIDENCE=0` during bulk determinism sweeps or
+  initial migrations) — renders:
+  - `<actual_root>/<name>.{ansi,png,html}` (plus `.frame.json`,
+    `.png.fidelity.json`, `.manifest.json`, `.verdict.json`),
+  - `<expected_root>/<name>.{png,html}` (rebuilt from the approved `.ansi`),
+  - `<diff_root>/<name>.png` (red-overlay pixel diff).
+  When `review_evidence` is `false`, PNG/HTML/diff rasterization is
+  skipped while the sealed `<actual_root>/<name>.{ansi,frame.json,manifest.json,verdict.json}`
+  and full cell verdict are still written so `accept` / `accept_matching`
+  work unchanged.
+- **Cross-cell grapheme cluster invariant (`frame_from_ansi`)**:
+  `render::ansi_dump` emits an `ESC[0m` reset (and re-emits the active
+  cell SGR) whenever two adjacent cells' symbols on a row would
+  otherwise join into a single UAX #29 extended grapheme cluster (e.g. a
+  regional-indicator flag pair in two `width=1` cells, `'e'` followed by
+  a separate cell holding `U+0301`, an emoji ZWJ sequence split across
+  single-grapheme cells, or adjacent Hangul L+V jamo cells), and
+  `GroupedStore::accept` in `AnsiCursor` mode enforces lossless
+  round-trip (`ansi_dump_with_cursor(&decoded) == text`), rejecting any
+  non-canonical candidate before it can be blessed.
+
+### Scratch roots, `run_id` freshness, and acceptance
+
+Actuals (`<root>.actual/`), rebuilt expected renders
+(`<root>.expected/`), diff PNGs (`<root>.diff/`), and the report
+(`<root>.actual/report.html`) live OUTSIDE the approved tree by default;
+override with `with_actual_root` / `with_expected_root` /
+`with_diff_root` / `with_report_path` (when `with_actual_root` ends in
+`actual` and `with_expected_root` was not explicitly called,
+`expected_root` automatically follows to the sibling `expected`
+directory). Configure a logical test-run identifier via
+`GroupedStore::with_run_id(id)` (or let it default to `NEXTEST_RUN_ID` /
+`TUISCOTTI_RUN_ID` when set in the environment) so every candidate
+`<name>.manifest.json` is stamped with `run_id`. Missing approvals fail
+closed; names with absolute paths, `..`, empty segments, or backslashes
+are rejected (`InvalidName`).
+
+Acceptance is explicit and guarded:
+- **Refuses in CI**: `Store::accept`, `GroupedStore::{accept, accept_matching, accept_all}`,
+  and `tuiscotti accept` fail closed if `CI` is set in the environment
+  (non-empty and not `"0"` or `"false"`).
+- **Candidate seal & verdict check**: every accepted candidate must have
+  a valid `<name>.manifest.json` and `<name>.verdict.json` whose SHA-256
+  digests match the files on disk (unsealed "ghost" `.ansi` files or
+  post-check tampered files are rejected). In pattern/bulk acceptance
+  (`accept_matching`), scenarios whose fresh verdict already recorded
+  `status == "matched"` are skipped automatically so only new or changed
+  candidates are copied.
+- **`run_id` freshness guard**: when `GroupedStore::with_run_id` is set,
+  or when multiple candidates matched by `accept_matching` carry
+  `run_id` stamps from different test runs, `accept_matching` rejects
+  stale candidates whose manifest `run_id` does not match the pinned or
+  newest run.
+- `accept(name)` blesses one scenario (in `AnsiCursor` mode, validates
+  `<actual>/<name>.ansi` via `frame_from_ansi` and lossless
+  `ansi_dump_with_cursor` round-trip, writes `<approved>/<name>.ansi`,
+  and removes any stale approved `.txt`/`.png`/`.html`/`.png.fidelity.json`),
+- `accept_matching(filter)` blesses all non-`matched` scenarios in
+  `actual_names()` matching an exact name, segment-aware prefix
+  (`group` / `group/`, where `pages/tab` matches `pages/tab/...` and
+  never `pages/tables/...`), or glob (`*` matches within a single path
+  segment without crossing `/`, `**` matches across `/`, and `?` matches
+  one non-`/` char), and errors when zero scenarios match,
+- `accept_all()` blesses every reviewed actual recursively and returns
+  the accepted names.
 
 The classic `Store` is unaffected; both share statuses, report
 machinery, and the renderer.

@@ -49,17 +49,22 @@ with correct advance + fidelity record. Offline `frame.json`
 re-renders are byte-identical (pinned by tests). Runners need no
 system fonts.
 
-## 6. Pure-cargo PTY engine: portable-pty + alacritty_terminal
+## 6. Pure-cargo PTY engine: `termpane` + `termpane-vt`
 
-The PTY engine is `portable-pty` 0.9 (PTY owner) + `alacritty_
-terminal` 0.26 (terminal state) from crates.io — no git/path deps,
-no patches, no vendored forks. Replaces, in order: the vendored
-vt100 fork, then the `termpane` git crate over vendored termlens.
-The adapter owns input encoding and query answering (the emulator
-parses modes but ships no encoder or query callbacks); that
+The PTY engine is released `termpane` `0.1` (PTY transport, process
+management, and damage-grid shadow terminal surface) over
+`termpane-vt` `0.1` (ECMA-48 / VT parser) from crates.io — no
+git/path deps, no patches, no vendored forks. Replaces, in order:
+the vendored `vt100` fork, the interim `portable-pty` +
+`alacritty_terminal` bridge, and the earlier unreleased `termpane`
+git prototype. Upstream `vt100` remains a dev-only differential
+oracle in `tuiscotti-fixtures` (never in normal runtime deps).
+The adapter owns input encoding (`tui/encode.rs`, `tui/encode_key.rs`)
+and drains emulator passthrough replies (`tui/capture.rs`); that
 behavior is qualified by `tool_qualification` + PTY matrix tests.
-Known gaps (silent unknown sequences, dropped cell blink, no
-scrollback reflow) are documented in LIMITATIONS.md, not hidden.
+Known backend gaps (`O5`, `O6`, `O7`, `O13`, silent unknown
+sequences, no scrollback reflow) are documented in
+[LIMITATIONS.md](LIMITATIONS.md), not hidden.
 
 ## 7. Typed op protocol over stdio, no daemon
 
@@ -103,15 +108,13 @@ retired with the crates/ restructure; full text survives in git history
 - SUPERSEDED — A09 (thin JS/TS + Python clients): foreign-language SDKs
   are out of scope. Clients, manifests, and client tests were removed;
   transport stays Rust-only (`tuiscotti` + `tuiscotti machine`).
-- TARGET (G1 in flight, sibling-owned) — R04 (registry portable-pty +
-  alacritty_terminal backend): the termpane-only backend boundary is
-  the declared target (`docs/TERMPANE-SWAP-PLAN.md`, sibling-owned),
-  but at head `75ff479` the tree still ships portable-pty 0.9 +
-  alacritty_terminal 0.26 per decision 6 above. Until G1 lands, no
-  doc may claim termpane-only as current.
-- TARGET (G1 in flight) — R05 (Ghostty binding qualification): moot
-  only once the backend decision becomes termpane-only; no
-  alternative emulator is evaluated in the meantime.
+- COMPLETED (G1 landed) — R04 (registry `termpane` + `termpane-vt`
+  backend): `tuiscotti-runtime` uses released `termpane` `0.1` +
+  `termpane-vt` `0.1` from crates.io as its sole PTY + terminal-state
+  backend per decision 6 above; `vt100` is a dev-only differential
+  oracle in `tuiscotti-fixtures`.
+- MOOT (G1 landed) — R05 (Ghostty binding qualification): moot now
+  that the backend boundary is `termpane` + `termpane-vt`.
 - RETAINED (re-mechanized) — M09 (pure-view builds without PTY/native
   deps): still required as workspace policy (pure view/screenshot
   configuration must not compile the terminal runtime); enforced via
@@ -137,3 +140,120 @@ clearance claimed. Checks performed: crates.io API lookup for
 no software usage of the name. Follow-on constraint: the hosted
 repo rename and crates.io publish need human admin/auth, so they
 stay manual steps outside any agent task.
+
+## 13. Path sanitization in provenance and candidate seals
+
+Committed and reviewable JSON artifacts (`Frame.provenance.argv`,
+`Manifest.profile.font_file`, and verdict/report links) sanitize
+filesystem paths to basenames (or relative store paths) before
+serialization so workstation-specific absolute paths (`/Users/...`,
+`/home/...`, temp directories) never leak into git-tracked snapshots
+or portable evidence bundles.
+
+## 14. Downstream 7,550-scenario feedback decisions (P1–P8)
+
+Findings from running a 7,550-scenario downstream Ratatui visual
+suite (`ratatui` `0.30`, `crossterm` `0.29`, 4 themes × 2 sizes ×
+multiple locales) drove eight durable design refinements:
+
+- **P1 — Bare `'f'`/`'F'` key parsing**: `parse_chord("f")` and
+  `Key::from_str("f")` parse as `Key::Char('f')`, while uppercase
+  `"F"` parses as `Key::Char('F')` (matching every other single
+  ASCII letter); function keys require explicit digits (`"F1"`..`"F12"`).
+- **P2 — SemVer caret ranges (`ratatui 0.30`, `crossterm 0.29`)**:
+  workspace dependencies use standard SemVer caret ranges (`Cargo.lock`
+  pins exact resolution for reproducible CI), `tuiscotti-core`'s
+  `ratatui` dependency targets `0.30`, and `crossterm` is removed from
+  `tuiscotti-core`.
+  - *Alternatives weighed*:
+    1. **(a) Standard SemVer caret ranges (`^`) on `ratatui = "0.30"` /
+       `crossterm = "0.29"` with `crossterm` dropped from `tuiscotti-core`
+       [chosen]**: downstream crates on current `ratatui 0.30` unify on a
+       single `ratatui`, `crossterm`, and `unicode-width` in `Cargo.lock`
+       with zero duplicate-crate `Buffer`/`Terminal` type mismatches and a
+       single `Frame` capture surface.
+    2. **(b) Per-major-version Cargo feature flags (`ratatui-029`,
+       `ratatui-030`) [rejected]**: violates Decision 10 (no legacy shims
+       or dual-version compatibility layers) and doubles the `ratatui`
+       adapter surface.
+    3. **(c) Separate `tuiscotti-ratatui` adapter crate [rejected]**:
+       splits the pure-view capture entrypoint across another crate
+       boundary without removing the version pin problem.
+- **P3 — Minimal `.ansi`-only grouped store (`ArtifactSet::AnsiCursor`)**:
+  `GroupedStore::with_artifacts(ArtifactSet::AnsiCursor)` commits only
+  `<name>.ansi` (via `render::ansi_dump_with_cursor`, which appends a
+  canonical VT cursor trailer `ESC[?25l` or
+  `ESC[?25h ESC[<y>;<x>H ESC[<Ps> q`). `formats::ansi::frame_from_ansi`
+  inverts `.ansi` back to a validated `Frame` so expected/actual
+  `.png` + `.html` and `.diff.png` are rendered on demand into
+  `actual_root`, `expected_root`, and `diff_root` only when a check
+  fails or approval is missing — cutting passing-run I/O and repo
+  footprint to 1 file per scenario while keeping full visual diff
+  artifacts on failure.
+  - *Alternatives weighed*:
+    1. **(a) Closed `ArtifactSet` enum (`All` default, `AnsiCursor`
+       minimal mode) on `GroupedStore` [chosen]**: makes invalid artifact
+       combinations unrepresentable, keeps fail-closed manifest/seal
+       schemas explicit per mode, and preserves one `GroupedStore` API.
+    2. **(b) Per-artifact boolean builder flags (`with_png(bool)`,
+       `with_html(bool)`, `with_txt(bool)`) [rejected]**: permits invalid
+       combinations (e.g. disabling all gates or writing `.html` without
+       the `.png` it references) and explodes the state space for
+       `verify_candidate` and `accept`.
+    3. **(c) Pluggable gate trait or separate store struct [rejected]**:
+       fragments CLI auto-detection (`tuiscotti accept --artifacts`) and
+       duplicates candidate sealing, `run_id` freshness, and report logic.
+- **P4 — Multi-match `BoundLocator` policies (`MatchPolicy`)**:
+  `BoundLocator` stays fail-closed (`MatchPolicy::Unique`) by default
+  and adds explicit `.first()`, `.last()`, `.nth(i)`, `.any()`,
+  `.count_at_least(n)` (assertion-only; `.click()` rejected with
+  `ActionError::Locate(LocateError::Usage(..))`),
+  `.expect_count_at_least(n)`, and `.expect_count_at_least_within(n, d)`
+  combinators so callers never drop down to detached `Locator::resolve`
+  loops when waiting on repeated UI chrome (`Locator::count_at_least`
+  was removed from unbound `Locator` in favor of
+  `Locator::expect_count_at_least` and `BoundLocator::count_at_least`).
+- **P5 — Bounded screen dump in `WaitError` `Display`**: `WaitError`'s
+  `Display` implementation appends the revision, grid dimensions, and a
+  bounded plain-text screen dump (up to 40 non-empty trailing-trimmed
+  rows / 4 KiB, or `<blank screen>`) so `unwrap()` / `?` failures in CI
+  logs show what was on screen immediately.
+- **P6 — Mismatch-only rasterization and full-resolution pixel verdicts**:
+  passing checks in `AnsiCursor` mode compare normalized `.ansi` bytes
+  in memory and skip `swash` PNG/HTML rasterization entirely (~0.37 ms
+  per passing gate at 120×40), while mismatch rendering uses slice-based
+  glyph blending, fast diff PNG encoding, and full-resolution
+  `PixelVerdict::score`.
+  - *Alternatives weighed*:
+    1. **(a) Skip rasterization on pass in `AnsiCursor` mode + slice-based
+       glyph/diff loops + `CompressionType::Fast` / `FilterType::Sub` diff
+       PNG encoding + consumer `[profile.dev.package."*"] opt-level = 3`,
+       keeping full-resolution 1:1 `PixelVerdict::score` [chosen]**:
+       cuts passing-gate cost in `AnsiCursor` mode to ~0.37 ms and keeps
+       mismatch checks at `35–70 ms` under `opt-level = 3` without
+       changing `PixelVerdict::score` or `PerceptualPolicy::allows`
+       outcomes.
+    2. **(b) Downsampling `hybrid_score` inside `compare_png` for frames
+       above `320×240` [rejected]**: changes `PixelVerdict::score` and
+       therefore alters `pixel_threshold` and `PerceptualPolicy::allows`
+       pass/fail decisions in default (`ArtifactSet::All`) and classic
+       stores.
+    3. **(c) Replacing the `swash` rasterizer with `ab_glyph` or
+       `fontdue` [rejected]**: breaks byte-identical PNG determinism and
+       glyph shaping/fallback fidelity (`SHA256SUMS`).
+- **P7 — Scoped CLI `accept` / `review --filter` + `.ansi` rendering**:
+  `tuiscotti accept` auto-detects classic vs grouped stores, accepts
+  exact names, segment-aware prefixes, or `*` (single-segment) / `**`
+  (multi-segment) / `?` globs (`GroupedStore::accept_matching`),
+  enforces candidate manifest sealing and `run_id` freshness, refuses in
+  `CI`, supports `--actual` and `--artifacts all|ansi-cursor`, and fails
+  loudly on zero matches. `tuiscotti review` adds `--filter <pattern>`,
+  and `tuiscotti render --input <file.ansi> --out <prefix>` renders
+  standalone `.ansi` captures to `png`, `html`, `svg`, `txt`, `json`,
+  `ansi`, or `ansi-cursor`.
+- **P8 — Explicit DEC mouse mode contract & PTY clock guidance**:
+  mouse methods document their exact DEC tracking (`1000`/`1002`/`1003`)
+  and SGR encoding (`1006`) requirements and error strings, and PTY
+  subprocess tests document the two-part deterministic clock/tick
+  environment + semantic-wait pattern ([LIMITATIONS.md](LIMITATIONS.md),
+  [TESTING.md](TESTING.md)).

@@ -344,3 +344,47 @@ fn raw_bytes_and_enter_key() {
     assert!(contains(&obs.screen, "raw-9").expect("screen rows readable"));
     s.close().expect("close succeeds");
 }
+
+#[test]
+fn press_letter_f_and_drag_rejects_press_release_only_mode() {
+    let s = Tui::new([
+        "/bin/sh",
+        "-c",
+        "printf '\\033[?1000h\\033[?1006hREADY\\r\\n'; stty raw -echo; cat -v",
+    ])
+    .size(60, 8)
+    .spawn()
+    .expect("spawn succeeds");
+    s.wait_predicate(
+        |o| contains(&o.screen, "READY").expect("screen rows readable"),
+        deadline(5),
+        &cancel(),
+    )
+    .expect("READY appears");
+
+    for spec in [
+        "f", "F", "shift+F", "shift-F", "ctrl+f", "ctrl-f", "alt-0", "backtab", "BackTab", "alt--",
+        "-", "F1", "F12",
+    ] {
+        s.press(spec).expect("press chord");
+    }
+    assert!(matches!(s.press("ctrl--"), Err(TuiError::Unsupported(_))));
+    for bad in ["F0", "F01", "f01", "F13", "fx", "foo-bar"] {
+        assert!(matches!(s.press(bad), Err(TuiError::Chord(_))), "{bad}");
+    }
+    s.wait_predicate(
+        |o| {
+            contains(&o.screen, "fFFF^F^F^[0^[[Z^[[Z^[-").expect("screen rows readable")
+                || contains(&o.screen, "fFFF^F^F").expect("screen rows readable")
+        },
+        deadline(5),
+        &cancel(),
+    )
+    .expect("chords echoed");
+
+    let err = s
+        .mouse_drag(MouseButton::Left, 5, 0, MouseMods::NONE)
+        .expect_err("mouse_drag requires DEC 1002/1003");
+    assert!(matches!(err, TuiError::ModeNotEnabled(_)), "got {err}");
+    s.close().expect("close succeeds");
+}

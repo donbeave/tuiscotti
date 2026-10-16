@@ -50,6 +50,8 @@ pub(crate) enum RenderFormat {
     Txt,
     /// Normalized VT/SGR screen dump.
     Ansi,
+    /// Normalized VT/SGR screen dump plus canonical VT cursor trailer.
+    AnsiCursor,
     /// Canonical frame JSON.
     Json,
     /// Static SVG render.
@@ -66,13 +68,22 @@ impl RenderFormat {
     pub(crate) fn extension(self) -> &'static str {
         match self {
             Self::Txt => "txt",
-            Self::Ansi => "ansi",
+            Self::Ansi | Self::AnsiCursor => "ansi",
             Self::Json => "json",
             Self::Svg => "svg",
             Self::Html => "html",
             Self::Png => "png",
         }
     }
+}
+
+/// Artifact set override for grouped `accept`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ArtifactSetArg {
+    /// Four-artifact grouped store (`.ansi`, `.txt`, `.png`, `.html`).
+    All,
+    /// Minimal artifact mode (`.ansi` with cursor trailer only).
+    AnsiCursor,
 }
 
 /// Journal event kind filter for `trace`. Typed, so an unknown `--kind` is a
@@ -131,8 +142,9 @@ pub(crate) enum Cmd {
         #[arg(long)]
         dir: PathBuf,
     },
-    /// Render a canonical frame.json to offline artifacts.
+    /// Render a canonical frame.json or normalized .ansi capture to offline artifacts.
     Render {
+        /// Input .frame.json or .ansi path.
         #[arg(long)]
         input: PathBuf,
         #[arg(long = "format")]
@@ -153,15 +165,24 @@ pub(crate) enum Cmd {
     Review {
         #[arg(long)]
         dir: PathBuf,
+        /// Optional scenario name filter (exact, prefix, or glob).
+        #[arg(long)]
+        filter: Option<String>,
     },
-    /// Approve one snapshot: actual → approved (explicit, per-name only;
-    /// frozen roots reject).
+    /// Approve one snapshot or matching grouped filter: actual → approved
+    /// (explicit, per-name or pattern; frozen roots reject).
     Accept {
-        /// Snapshot name (e.g. `home`, `pages/overview`).
+        /// Snapshot name or filter (e.g. `home`, `pages/overview`, `pages/*`).
         name: String,
-        /// Snapshot store root (holds `approved/` + `actual/`).
+        /// Snapshot store root (holds `approved/` + `actual/`, or grouped approved root).
         #[arg(long, default_value = ".")]
         store: PathBuf,
+        /// Override actual-artifacts root for grouped stores.
+        #[arg(long)]
+        actual: Option<PathBuf>,
+        /// Explicit grouped artifact set (`all` or `ansi-cursor`).
+        #[arg(long)]
+        artifacts: Option<ArtifactSetArg>,
     },
     /// Write a standalone offline HTML report from verdicts.
     Report {
@@ -285,8 +306,13 @@ pub(crate) fn run(cli: Cli) -> i32 {
             font_file,
         } => crate::ops_offline::cmd_render(&input, &formats, &out, font_file.as_deref()),
         Cmd::Diff { expected, actual } => crate::ops_offline::cmd_diff(&expected, &actual),
-        Cmd::Review { dir } => crate::ops_offline::cmd_review(&dir),
-        Cmd::Accept { name, store } => crate::ops_offline::cmd_accept(&store, &name),
+        Cmd::Review { dir, filter } => crate::ops_offline::cmd_review(&dir, filter.as_deref()),
+        Cmd::Accept {
+            name,
+            store,
+            actual,
+            artifacts,
+        } => crate::ops_offline::cmd_accept(&store, &name, actual.as_deref(), artifacts),
         Cmd::Report { dir, out, title } => crate::ops_offline::cmd_report(&dir, &out, &title),
         Cmd::Import { dir } => crate::ops_offline::cmd_import(&dir),
         Cmd::Session { cmd } => crate::ops_run::cmd_session(cmd),

@@ -308,6 +308,35 @@ docs churn outside this fix's scope). Steady-state floor (nothing dirty):
   are not comparable to this suite. This file is now the only performance
   report; raw history lives in `benches/results/`.
 
+### P6 review rendering and mismatch-path optimization study
+
+Measured on populated `80x24`, `120x40`, and `160x50` frames (styled ASCII, box-drawing borders, CJK wide cells, and a 1-cell mismatch between expected and actual) across the full mismatch review path (`2× Renderer::render_artifacts` + `diff::compare_png(&expected.png, &actual.png)`):
+
+- **Strict gate and full-resolution `PixelVerdict::score` preserved**: decoded-pixel comparison (`pixels_equal_under`) runs at full resolution over `as_chunks::<4>()` slices, `PixelVerdict::score` (`hybrid_score`) is computed at full 1:1 resolution (preserving exact default-store perceptual threshold scores `0.999853` at `80x24`, `0.999940` at `120x40`, and `0.999963` at `160x50` so `pixel_threshold` and `PerceptualPolicy::allows` gate outcomes never shift), and `Renderer::render` keeps byte-identical PNG/HTML output (`crates/tuiscotti-fixtures/tests/SHA256SUMS` unchanged).
+- **Optimizations**:
+  1. `diff::compare_png`: separated `hybrid_score` from `encode_diff_png` (so `perceptual_score` never encodes a throwaway PNG) and encoded `diff_png` in a single slice pass (`as_chunks::<4>()` + `as_chunks_mut::<3>()`) with `PngEncoder::new_with_quality(..., CompressionType::Fast, FilterType::Sub)` instead of `FilterType::Adaptive`.
+  2. `render::glyph` / `render::draw`: replaced per-pixel `get_pixel_mut` / `put_pixel` bounds-checked calls in `blend` and `fill_rect` with direct row-slice access (`as_chunks_mut::<3>()`), added an opaque `cov == 255` fast path, and iterated glyph bitmaps row-by-row (`chunks_exact(m.width)`) instead of per-pixel integer division/modulo.
+  3. `render::fonts`: cached SHA-256 verification of the static `VENDORED_FALLBACK_FACES` bytes in a `OnceLock` (cutting warm `Renderer::new` from `5.85 ms` to `0.27 ms` in `opt-level = 0`).
+  4. `render::svg`: avoided `Frame::clone()` in `html_document` via `Cow::Borrowed` when `provenance.created_unix == 0` and pre-sized the HTML output buffer.
+
+| Frame size | Consumer `package."*"` `opt-level = 3` total (ms) | Narrow 7-crate allowlist total (ms) | Unoptimized `opt-level = 0` before (ms) |
+|---|---:|---:|---:|
+| `80x24` | ~35 ms (`27.6 ms` micro-bench) | ~165 ms | 2427.71 ms |
+| `120x40` | ~60 ms (`67.3 ms` micro-bench) | ~210 ms | 7759.18 ms |
+| `160x50` | ~70 ms (`112.6 ms` micro-bench) | ~257 ms | 10185.75 ms |
+
+#### Recommended consumer profile overrides for `cargo test`
+
+In `opt-level = 0`, not only `tuiscotti-render`, `image`, `image-compare`, `png`, `miniz_oxide`, `flate2`, and `swash`, but also `tuiscotti-core`, `serde_json`, `sha2`, `unicode-segmentation`, and font-loading transitive crates (`zeno`, `yazi`, `read-fonts`, `skrifa`) execute on the mismatch and artifact-sealing path. Optimizing only a narrow 7-crate allowlist leaves those transitive dependencies at `opt-level = 0` (`165–257 ms` per mismatch check), whereas optimizing all non-workspace dependencies yields `35 ms` at `80x24`, `60 ms` at `120x40`, and `70 ms` at `160x50` while keeping fast incremental debug builds for the consumer's own workspace crates:
+
+```toml
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.test.package."*"]
+opt-level = 3
+```
+
 ## Findings for follow-up
 
 1. g7-view-edit — RESOLVED (study above): 5 test-profile units per touch
@@ -315,9 +344,12 @@ docs churn outside this fix's scope). Steady-state floor (nothing dirty):
    codegen on all five. Fix: `[profile.test] debug="line-tables-only"`.
    Contended-box misses were environmental (quiet HEAD already passes);
    re-prove on the quiet final-head rerun like every other number here.
-2. compare-changed cost (93 ms p50 at 200x60): the hybrid-diagnostic +
-   diff-PNG path dominates mismatch verdicts; stream or downscale the
-   diagnostic (never the strict verdict).
+2. compare-changed cost — RESOLVED (P6 study above): kept `PixelVerdict::score`
+   at full 1:1 resolution (so `pixel_threshold` and `PerceptualPolicy`
+   verdicts stay identical) while switching `diff_png` to single-pass
+   slice construction + fast PNG encoding (`CompressionType::Fast`,
+   `FilterType::Sub`) and slice-based glyph blending, reaching `35–70 ms`
+   per full mismatch check with `[profile.dev.package."*"] opt-level = 3`.
 3. Cache-hit value is thin (~20–25% under a warm render): full-decode
    validation dominates; a cheaper integrity check would buy the hit path
    back (without weakening rejection of corrupt entries).

@@ -44,7 +44,20 @@ running the same unit commands. Until then: "compiles for
 - Blink phase is frozen visible; slow/rapid rates stay combined.
   Overline is dropped (O17). Raw-ANSI replay cannot observe cursor
   appearance (block/steady cursor) — use PTY captures for cursor
-  shape/blink assertions.
+  shape/blink assertions, or `render::ansi_dump_with_cursor` +
+  `formats::ansi::frame_from_ansi` for normalized `.ansi` captures with
+  a canonical VT cursor trailer.
+- **Normalized `.ansi` cross-cell grapheme clusters
+  (`formats::ansi::frame_from_ansi`)**: `render::ansi_dump` inserts an
+  `ESC[0m` reset (followed by the active cell SGR) whenever two adjacent
+  cells' symbols on a row would otherwise join into a single UAX #29
+  extended grapheme cluster (e.g. adjacent regional-indicator flag
+  cells, `'e'` followed by a cell containing `U+0301`, an emoji ZWJ
+  sequence split across single-grapheme cells, or adjacent Hangul L+V
+  jamo cells), so `frame_from_ansi` decodes each cell without joining.
+  In addition, `GroupedStore::accept` in `ArtifactSet::AnsiCursor` mode
+  enforces lossless round-trip (`ansi_dump_with_cursor(&decoded) == text`)
+  and rejects any `.ansi` candidate that does not round-trip identically.
 - No scrollback reflow on resize (emulator constraint).
 
 ## Emulator honesty gaps
@@ -64,6 +77,52 @@ running the same unit commands. Until then: "compiles for
   nominal defaults (live + replay pinned); O7 — OSC 10/11 set
   forms are dropped, default-color overrides never observed;
   O13 — CSI 14/16/18t (text-area size) are never answered.
+
+## Mouse DEC mode requirements
+
+Mouse input fails closed with `TuiError::ModeNotEnabled` (or
+`ActionError::Session(TuiError::ModeNotEnabled(...))` on
+`BoundLocator::click`) unless the application under test has enabled
+the required tracking mode on the live PTY surface:
+
+| Method | Required DEC tracking mode | Encoding | Error when mode is off |
+|---|---|---|---|
+| `Session::click` / `BoundLocator::click` / `mouse_down` / `mouse_up` / `mouse_wheel` | `DECSET 1000` (`\x1b[?1000h`, normal press/release), `1002` (`\x1b[?1002h`, button-event drag), or `1003` (`\x1b[?1003h`, any-event motion) | SGR `DECSET 1006` (`\x1b[?1006h`, recommended for coords > 223 and distinct press/release), UTF-8 `1005`, or X10 | `TuiError::ModeNotEnabled("mouse reporting (DEC 1000/1002/1003) not enabled by the application")` |
+| `Session::mouse_drag` | `DECSET 1002` or `1003` (`1000` alone is rejected) | SGR `1006` (recommended), UTF-8 `1005`, or X10 | `TuiError::ModeNotEnabled("mouse drag reporting (DEC 1002/1003) not enabled by the application")` |
+| `Session::mouse_move` (hover without buttons) | `DECSET 1003` (`\x1b[?1003h`; `1000` or `1002` alone is rejected) | SGR `1006` (recommended), UTF-8 `1005`, or X10 | `TuiError::ModeNotEnabled("mouse motion reporting (DEC 1003) not enabled by the application")` |
+
+## Clock and Time Control in PTY Subprocesses
+
+`tui::Tui` spawns a real OS child process attached to a kernel PTY.
+Because the child executes in its own address space and schedules its
+own timers and syscalls (`clock_gettime`, `epoll`/`kqueue`), the test
+harness cannot inject a virtual Rust clock into an arbitrary child
+binary over a PTY, and `Session::wait_stable_quiet` measures real
+wall-clock PTY byte silence on the reader thread.
+
+For deterministic visual baselines of applications with animations,
+blinking cursors, spinners, or wall-clock status bars, use a two-part
+pattern:
+
+1. **App-side deterministic clock / tick env convention**: read an
+   environment variable in the binary under test — passed via
+   `Tui::new(cmd).env("TUISCOTTI_FIXED_TIME", "2026-01-01T00:00:00Z")`
+   or `Tui::new(cmd).env("APP_TICK_MS", "0")` (or a key-driven step
+   mode) — so wall-clock timestamps, spinners, and periodic ticks
+   freeze or advance only on explicit input during visual baseline
+   runs. Note: on Unix, the underlying PTY spawner (`portable-pty` via
+   `termpane`) populates `SHELL` from the user's `passwd` entry when
+   `SHELL` is unset in the child environment, so callers that render or
+   branch on `$SHELL` should pass `.env("SHELL", "/bin/sh")` alongside
+   `.env_clear(true)`.
+2. **Wait-side semantic readiness + short quiet window**: wait for an
+   explicit application readiness marker first
+   (`session.get_by_text("Ready").any().expect_visible()?` or
+   `wait_predicate`), then optionally call a short
+   `session.wait_stable_quiet(deadline, Duration::from_millis(50), &cancel)?`
+   to let trailing frame bytes flush — never use a large
+   `wait_stable_quiet(400ms)` alone as a substitute for semantic
+   readiness.
 
 ## Scope
 
